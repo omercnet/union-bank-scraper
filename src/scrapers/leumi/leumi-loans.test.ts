@@ -26,9 +26,11 @@ const fixedTrack: LeumiMortgageTrack = {
   linkageBase: 'לא',
   loanCreditDate: '15.03.22',
   calculateEndDate: '10.03.47',
+  lastPaymentAmount: 1500,
+  // like the real response, every track repeats the whole mortgage's payments
   paymentItems: [
-    { paymentDate: '10.2026', paymentAmount: 1510 },
-    { paymentDate: '09.2026', paymentAmount: 1500 },
+    { paymentDate: '10.2026', paymentAmount: 2500 },
+    { paymentDate: '09.2026', paymentAmount: 2480 },
   ],
 };
 
@@ -41,10 +43,7 @@ const primeTrack: LeumiMortgageTrack = {
   clearingBalance: 150500,
   annualInterestPercent: 5.25,
   interestType: 'VARIABLE',
-  paymentItems: [
-    { paymentDate: '10.2026', paymentAmount: 990 },
-    { paymentDate: '09.2026', paymentAmount: 1000 },
-  ],
+  lastPaymentAmount: 1000,
 };
 
 const mortgageDetail: LeumiMortgageDetail = {
@@ -52,6 +51,7 @@ const mortgageDetail: LeumiMortgageDetail = {
   currencyLeumi: '080',
   clearingBalance: 401500,
   mortgageAmount: 500000,
+  lastPaymentAmount: 2500,
   bookingDate: '15.03.22',
   mortgageEndDate: '10.03.47',
   mortgagePurpose: 'לווה פרטי-מגורים',
@@ -113,7 +113,7 @@ describe('parseAmount', () => {
 });
 
 describe('mapMortgageTrack', () => {
-  test('maps a track, taking the newest payment as the last payment', () => {
+  test('maps a track', () => {
     expect(mapMortgageTrack(fixedTrack, '123-45678_90')).toEqual({
       type: LoanTypes.Mortgage,
       accountNumber: '123-45678_90',
@@ -125,7 +125,7 @@ describe('mapMortgageTrack', () => {
       totalBalance: 251000,
       startDate: expect.stringMatching(/^2022-03-1[45]T/),
       endDate: expect.stringMatching(/^2047-03-(09|10)T/),
-      lastPaymentAmount: 1510,
+      lastPaymentAmount: 1500,
       interestRate: 4.5,
       interestType: LoanInterestTypes.Fixed,
       linkage: LoanLinkageTypes.None,
@@ -142,8 +142,12 @@ describe('mapMortgageTrack', () => {
     expect(track?.endDate).toBeUndefined();
   });
 
-  test('leaves the last payment undefined when there is no payment history', () => {
-    expect(mapMortgageTrack({ ...fixedTrack, paymentItems: [] }, '')?.lastPaymentAmount).toBeUndefined();
+  test("takes the track's own payment, not the mortgage payment repeated in its payment history", () => {
+    expect(mapMortgageTrack(primeTrack, '')?.lastPaymentAmount).toBe(1000);
+  });
+
+  test('leaves the last payment undefined when the track has none', () => {
+    expect(mapMortgageTrack({ ...fixedTrack, lastPaymentAmount: null }, '')?.lastPaymentAmount).toBeUndefined();
   });
 });
 
@@ -166,15 +170,20 @@ describe('mapMortgage', () => {
     expect(mortgage?.tracks?.every(track => track.accountNumber === '123-45678_90')).toBe(true);
   });
 
-  test('does not sum last payments from different months', () => {
-    const lateTrack = { ...primeTrack, paymentItems: [{ paymentDate: '09.2026', paymentAmount: 1000 }] };
-    expect(mapMortgage(mortgageDetail, [fixedTrack, lateTrack])?.lastPaymentAmount).toBeUndefined();
+  test("takes the mortgage's own payment rather than summing the tracks' payment histories", () => {
+    const tracks = [fixedTrack, primeTrack, { ...primeTrack, loanId: '333' }].map(track => ({
+      ...track,
+      paymentItems: fixedTrack.paymentItems,
+    }));
+    const mortgage = mapMortgage(mortgageDetail, tracks);
+    expect(mortgage?.lastPaymentAmount).toBe(2500);
+    expect(mortgage?.tracks?.map(track => track.lastPaymentAmount)).toEqual([1500, 1000, 1000]);
   });
 
   test('leaves tracks undefined when they could not be fetched, not empty', () => {
     const mortgage = mapMortgage(mortgageDetail, undefined);
     expect(mortgage?.tracks).toBeUndefined();
-    expect(mortgage?.lastPaymentAmount).toBeUndefined();
+    expect(mortgage?.lastPaymentAmount).toBe(2500);
   });
 
   test('leaves tracks undefined when any track cannot be mapped, rather than returning a partial list', () => {
@@ -198,14 +207,10 @@ describe('mapMortgage', () => {
     expect(mapMortgage({ ...mortgageDetail, portfolioAccountsItems: [] }, [fixedTrack])).toBeNull();
   });
 
-  test('does not report a last payment of zero before any payment was made', () => {
-    const noHistory = [fixedTrack, primeTrack].map(track => ({ ...track, paymentItems: [] }));
-    expect(mapMortgage(mortgageDetail, noHistory)?.lastPaymentAmount).toBeUndefined();
-  });
-
-  test('does not sum the last payment of a track that could not be mapped', () => {
-    const mortgage = mapMortgage(mortgageDetail, [fixedTrack, { ...primeTrack, currencyLeumi: '999' }]);
-    expect(mortgage?.lastPaymentAmount).toBeUndefined();
+  test('leaves the last payment undefined when the mortgage has none', () => {
+    expect(
+      mapMortgage({ ...mortgageDetail, lastPaymentAmount: null }, [fixedTrack])?.lastPaymentAmount,
+    ).toBeUndefined();
   });
 });
 

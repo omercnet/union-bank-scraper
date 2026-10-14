@@ -67,6 +67,8 @@ export interface LeumiMortgageDetail {
   currencyLeumi: string;
   clearingBalance: number;
   mortgageAmount: number;
+  // the whole mortgage's most recent periodic payment
+  lastPaymentAmount?: number | null;
   bookingDate: string;
   mortgageEndDate: string;
   mortgagePurpose?: string;
@@ -90,7 +92,9 @@ export interface LeumiMortgageTrack {
   linkageBase?: string | null;
   loanCreditDate?: string | null;
   calculateEndDate?: string | null;
-  // the last payments made, newest first, with month-only dates ("MM.YYYY")
+  // the track's own share of the most recent periodic payment
+  lastPaymentAmount?: number | null;
+  // the whole mortgage's recent payments, repeated on every track, so they are not the track's own
   paymentItems?: { paymentDate: string; paymentAmount: number }[] | null;
 }
 
@@ -193,26 +197,11 @@ export function mapMortgageTrack(track: LeumiMortgageTrack, accountNumber: strin
     totalBalance: toNumber(track.clearingBalance),
     startDate: parseDate(track.loanCreditDate),
     endDate: parseDate(track.calculateEndDate),
-    lastPaymentAmount: toNumber(track.paymentItems?.[0]?.paymentAmount),
+    lastPaymentAmount: toNumber(track.lastPaymentAmount),
     interestRate: toNumber(track.annualInterestPercent),
     interestType: mapInterestType(track.interestType),
     linkage: mapLinkage(track.linkageBase),
   };
-}
-
-/**
- * Sums the tracks' most recent payments, only when every track reports a payment for the same month.
- */
-function getMortgageLastPaymentAmount(tracks: LeumiMortgageTrack[]): number | undefined {
-  const lastPayments = tracks.map(track => track.paymentItems?.[0]);
-  const month = lastPayments[0]?.paymentDate;
-  if (
-    !month ||
-    lastPayments.some(payment => payment?.paymentDate !== month || toNumber(payment.paymentAmount) === undefined)
-  ) {
-    return undefined;
-  }
-  return lastPayments.reduce((sum, payment) => sum + (payment?.paymentAmount ?? 0), 0);
 }
 
 /**
@@ -261,8 +250,7 @@ export function mapMortgage(detail: LeumiMortgageDetail, tracks: LeumiMortgageTr
     totalBalance: toNumber(detail.clearingBalance),
     startDate: parseDate(detail.bookingDate),
     endDate: parseDate(detail.mortgageEndDate),
-    // computed only from tracks that were all mapped, so a rejected track (e.g. another currency) isn't summed in
-    lastPaymentAmount: tracks && mappedTracks ? getMortgageLastPaymentAmount(tracks) : undefined,
+    lastPaymentAmount: toNumber(detail.lastPaymentAmount),
     tracks: mappedTracks,
   };
 }
