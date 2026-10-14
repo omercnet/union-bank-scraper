@@ -112,6 +112,14 @@ export interface Loan {
    */
   lastPaymentAmount?: number;
   /**
+   * the amount of the next scheduled payment
+   */
+  nextPaymentAmount?: number;
+  /**
+   * ISO date string of the next scheduled payment
+   */
+  nextPaymentDate?: string;
+  /**
    * annual interest rate in percent, e.g. 4.5 for 4.5%
    */
   interestRate?: number;

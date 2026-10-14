@@ -10,8 +10,48 @@ const BASE_URL = 'https://hb2.bankleumi.co.il';
 const MORTGAGE_DETAILS_URL = `${BASE_URL}/uiapiproxy/v1/digital-retails/mobile/mortgageDetails`;
 const getMortgageLoanInfoUrl = (mortgageKey: string) =>
   `${BASE_URL}/uiapiproxy/v1/digital-retails/mobile/${mortgageKey}/loanInfo`;
+const SUMMARY_DATA_URL = `${BASE_URL}/UIApiProxy/v1/digital-retails/mobile/accounts/1/SummaryData`;
+const LOAN_ACTIVITY_URL = `${BASE_URL}/eBanking/LoanAndMortgages/DisplayLoanActivity.aspx`;
 
 const DATE_FORMAT = 'DD.MM.YY';
+const LOAN_PAGE_DATE_FORMAT = 'DD/MM/YY';
+
+// the account type of regular loans in the summary data
+const SUMMARY_LOAN_TYPE = 'LOAN';
+
+const LOAN_SELECTOR = '#ddlAccounts_m_ddl';
+// value of the "choose a loan" placeholder option
+const LOAN_SELECTOR_PLACEHOLDER = '-1';
+const LOAN_DETAILS_PANEL = '#pnlVariousData';
+const LOAN_FIELD_LABEL_SELECTOR = 'td[class^="Summary_lable"]';
+
+// labels of the loan details page fields, without the trailing colon
+const LOAN_LABELS = {
+  type: 'סוג',
+  account: 'חשבון',
+  loanNumber: 'מספר הלוואה',
+  currency: 'מטבע',
+  originalAmount: 'סכום הלוואה מקורי',
+  principalBalance: 'יתרת קרן',
+  nextPaymentAmount: 'סכום התשלום הבא',
+  linkage: 'סוג הצמדה',
+  interestRate: 'שיעור ריבית',
+  startDate: 'תאריך העמדת הלוואה',
+  endDate: 'תאריך סיום',
+  nextPaymentDate: 'תאריך התשלום הבא',
+};
+
+const LOAN_PAGE_CURRENCIES: Record<string, string> = {
+  '₪': SHEKEL_CURRENCY,
+};
+
+// linkage labels seen on the loan details page
+const LOAN_PAGE_LINKAGES: Record<string, LoanLinkageTypes> = {
+  'לא צמוד': LoanLinkageTypes.None,
+};
+
+// marks a fixed rate in the loan type label, e.g. "לא צמוד ר.קבועה"
+const FIXED_RATE_LABEL = 'ר.קבועה';
 
 // Leumi's internal currency codes
 const LEUMI_CURRENCIES: Record<string, string> = {
@@ -58,12 +98,20 @@ export interface LeumiLoanInfoResponse {
   MortgageDetails?: { loansItems?: LeumiMortgageTrack[] | null } | null;
 }
 
-function parseDate(value?: string | null): string | undefined {
+function parseDate(value?: string | null, format = DATE_FORMAT): string | undefined {
   if (!value) {
     return undefined;
   }
-  const date = moment(value, DATE_FORMAT, true);
+  const date = moment(value.trim(), format, true);
   return date.isValid() ? date.toISOString() : undefined;
+}
+
+function parseAmount(value?: string): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const amount = parseFloat(value.replace(/[^\d.-]/g, ''));
+  return Number.isNaN(amount) ? undefined : amount;
 }
 
 export function mapLeumiCurrency(code: string): string | undefined {
@@ -200,6 +248,121 @@ async function fetchMortgageTracks(page: Page, mortgageKey: string): Promise<Leu
 }
 
 /**
+ * Maps the label/value pairs of a loan details page, e.g. { "מספר הלוואה": "123" }.
+ */
+export function mapLoanPageFields(fields: Record<string, string>): Loan | null {
+  const currency = LOAN_PAGE_CURRENCIES[fields[LOAN_LABELS.currency]];
+  const loanId = fields[LOAN_LABELS.loanNumber];
+  const account = fields[LOAN_LABELS.account];
+  const originalAmount = parseAmount(fields[LOAN_LABELS.originalAmount]);
+  if (!currency || !loanId || !account || originalAmount === undefined) {
+    debug('could not parse the loan currency, number, account or original amount');
+    return null;
+  }
+
+  const name = fields[LOAN_LABELS.type];
+  return {
+    type: LoanTypes.Loan,
+    accountNumber: account.replace('/', '_'),
+    loanId,
+    name,
+    currency,
+    originalAmount,
+    principalBalance: parseAmount(fields[LOAN_LABELS.principalBalance]),
+    startDate: parseDate(fields[LOAN_LABELS.startDate], LOAN_PAGE_DATE_FORMAT),
+    endDate: parseDate(fields[LOAN_LABELS.endDate], LOAN_PAGE_DATE_FORMAT),
+    nextPaymentAmount: parseAmount(fields[LOAN_LABELS.nextPaymentAmount]),
+    nextPaymentDate: parseDate(fields[LOAN_LABELS.nextPaymentDate], LOAN_PAGE_DATE_FORMAT),
+    interestRate: parseAmount(fields[LOAN_LABELS.interestRate]),
+    interestType: name?.includes(FIXED_RATE_LABEL) ? LoanInterestTypes.Fixed : undefined,
+    linkage: LOAN_PAGE_LINKAGES[fields[LOAN_LABELS.linkage]],
+  };
+}
+
+interface LeumiSummaryData {
+  multiCheckingFlag?: boolean;
+  TotalPerTypeItems?: { accountType: string }[] | null;
+}
+
+/**
+ * Tells from the account summary whether the customer has regular loans, so the loans page
+ * is only required when there are loans to read from it. Returns undefined when it can't tell.
+ */
+export function hasRegularLoans(summary: LeumiSummaryData | null): boolean | undefined {
+  // the summary is of a single account, so it can't rule out loans of other accounts
+  if (!summary || !Array.isArray(summary.TotalPerTypeItems) || summary.multiCheckingFlag !== false) {
+    return undefined;
+  }
+  return summary.TotalPerTypeItems.some(item => item.accountType === SUMMARY_LOAN_TYPE);
+}
+
+async function scrapeLoanPageFields(page: Page): Promise<Record<string, string>> {
+  return page.$$eval(LOAN_FIELD_LABEL_SELECTOR, labels =>
+    Object.fromEntries(
+      labels.map(label => [
+        (label.textContent ?? '').replace(':', '').trim(),
+        (label.nextElementSibling?.textContent ?? '').trim(),
+      ]),
+    ),
+  );
+}
+
+/**
+ * Reads the loan details pages, one per loan in the loans dropdown.
+ */
+async function fetchRegularLoans(page: Page): Promise<Loan[] | undefined> {
+  await page.goto(LOAN_ACTIVITY_URL, { waitUntil: 'networkidle2' });
+  if (!(await page.$(LOAN_SELECTOR))) {
+    debug('loans dropdown not found');
+    return undefined;
+  }
+
+  const loanIndexes = await page.$$eval(
+    `${LOAN_SELECTOR} option`,
+    (options, placeholder) => options.map(option => option.value).filter(value => !!value && value !== placeholder),
+    LOAN_SELECTOR_PLACEHOLDER,
+  );
+  debug('found %d regular loans', loanIndexes.length);
+
+  // each loan is shown on its own page, so they must be fetched sequentially
+  const loans: Loan[] = [];
+  for (const loanIndex of loanIndexes) {
+    await page.goto(`${LOAN_ACTIVITY_URL}?index=${encodeURIComponent(loanIndex)}`, { waitUntil: 'networkidle2' });
+    if (!(await page.$(LOAN_DETAILS_PANEL))) {
+      debug('loan details not found');
+      return undefined;
+    }
+    const loan = mapLoanPageFields(await scrapeLoanPageFields(page));
+    if (!loan) {
+      return undefined;
+    }
+    loans.push(loan);
+  }
+  return loans;
+}
+
+async function fetchMortgages(page: Page): Promise<Loan[] | undefined> {
+  const mortgageDetails = await fetchGetWithinPage<LeumiMortgageDetailsResponse>(page, MORTGAGE_DETAILS_URL);
+  const mortgages = mortgageDetails?.loanMortgageItems;
+  if (!Array.isArray(mortgages)) {
+    debug('unexpected mortgage details response');
+    return undefined;
+  }
+  debug('found %d mortgages', mortgages.length);
+
+  const loans: Loan[] = [];
+  for (const { MortgageDetail: detail } of mortgages) {
+    const tracks = await fetchMortgageTracks(page, detail.mortgageKey);
+    const mortgage = mapMortgage(detail, tracks);
+    if (!mortgage) {
+      return undefined;
+    }
+    loans.push(mortgage);
+  }
+  return loans;
+}
+
+/**
  * Returns undefined, rather than an empty or partial list, whenever the loans could not be
  * fully fetched, so consumers can tell "no loans" apart from "unknown".
  */
@@ -207,28 +370,22 @@ export async function fetchLeumiLoans(page: Page): Promise<Loan[] | undefined> {
   debug('========== FETCHING LOANS ==========');
 
   try {
-    const mortgageDetails = await fetchGetWithinPage<LeumiMortgageDetailsResponse>(page, MORTGAGE_DETAILS_URL);
-    const mortgages = mortgageDetails?.loanMortgageItems;
-    if (!Array.isArray(mortgages)) {
-      debug('unexpected mortgage details response');
+    const mortgages = await fetchMortgages(page);
+    if (!mortgages) {
       return undefined;
     }
-    debug('found %d mortgages', mortgages.length);
 
-    const loans: Loan[] = [];
-    for (const { MortgageDetail: detail } of mortgages) {
-      const tracks = await fetchMortgageTracks(page, detail.mortgageKey);
-      const mortgage = mapMortgage(detail, tracks);
-      if (!mortgage) {
-        return undefined;
-      }
-      loans.push(mortgage);
+    const summary = await fetchGetWithinPage<LeumiSummaryData>(page, SUMMARY_DATA_URL, true).catch(() => null);
+    const regularLoans = hasRegularLoans(summary) === false ? [] : await fetchRegularLoans(page);
+    if (!regularLoans) {
+      return undefined;
     }
 
+    const loans = [...mortgages, ...regularLoans];
     debug('returning %d loans', loans.length);
     return loans;
   } catch (error) {
-    debug('error fetching mortgages: %s', error);
+    debug('error fetching loans: %s', error);
     return undefined;
   }
 }

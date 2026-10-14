@@ -2,8 +2,10 @@ import { type Page } from 'puppeteer';
 import { LoanInterestTypes, LoanLinkageTypes, LoanTypes } from '../../transactions';
 import {
   fetchLeumiLoans,
+  hasRegularLoans,
   mapInterestType,
   mapLinkage,
+  mapLoanPageFields,
   mapMortgage,
   mapMortgageTrack,
   mapPortfolioAccountNumber,
@@ -171,9 +173,95 @@ describe('mapMortgage', () => {
   });
 });
 
+describe('mapLoanPageFields', () => {
+  const fields = {
+    'נכון לתאריך': '14/10/26',
+    סוג: 'לא צמוד ר.קבועה',
+    חשבון: '123-45678/90',
+    'מספר הלוואה': '87654321',
+    מטבע: '₪',
+    'מטרת הלוואה': 'הל. לכל מטרה',
+    'תשלומים שנותרו': '30',
+    'סכום הלוואה מקורי': '60,000.00',
+    'יתרת קרן': '42,500.50',
+    'סכום הלוואה משוערך בש"ח': '42,500.50',
+    'סכום התשלום הבא': '1,650.25',
+    'סוג הצמדה': 'לא צמוד',
+    'שיעור ריבית': '6.10%',
+    'תאריך העמדת הלוואה': '01/05/24',
+    'תאריך סיום': '01/05/29',
+    'תאריך התשלום הבא': '01/11/26',
+  };
+
+  test('maps a loan details page', () => {
+    expect(mapLoanPageFields(fields)).toEqual({
+      type: LoanTypes.Loan,
+      accountNumber: '123-45678_90',
+      loanId: '87654321',
+      name: 'לא צמוד ר.קבועה',
+      currency: 'ILS',
+      originalAmount: 60000,
+      principalBalance: 42500.5,
+      startDate: expect.stringMatching(/^2024-0(4-30|5-01)T/),
+      endDate: expect.stringMatching(/^2029-0(4-30|5-01)T/),
+      nextPaymentAmount: 1650.25,
+      nextPaymentDate: expect.stringMatching(/^2026-1(0-31|1-01)T/),
+      interestRate: 6.1,
+      interestType: LoanInterestTypes.Fixed,
+      linkage: LoanLinkageTypes.None,
+    });
+  });
+
+  test('leaves the interest type and linkage undefined for labels it does not know', () => {
+    const loan = mapLoanPageFields({ ...fields, סוג: 'מט"י ז"א', 'סוג הצמדה': 'צמוד מדד' });
+    expect(loan?.interestType).toBeUndefined();
+    expect(loan?.linkage).toBeUndefined();
+  });
+
+  test('returns null for a foreign currency loan rather than guessing', () => {
+    expect(mapLoanPageFields({ ...fields, מטבע: '$' })).toBeNull();
+  });
+
+  test('returns null when the loan number is missing', () => {
+    expect(mapLoanPageFields({ ...fields, 'מספר הלוואה': '' })).toBeNull();
+  });
+});
+
+describe('hasRegularLoans', () => {
+  test('is true when the summary has a loans total', () => {
+    expect(
+      hasRegularLoans({
+        multiCheckingFlag: false,
+        TotalPerTypeItems: [{ accountType: 'CHECKING' }, { accountType: 'LOAN' }],
+      }),
+    ).toBe(true);
+  });
+
+  test('is false when the summary has no loans total', () => {
+    expect(hasRegularLoans({ multiCheckingFlag: false, TotalPerTypeItems: [{ accountType: 'CHECKING' }] })).toBe(false);
+  });
+
+  test('is unknown for customers with multiple checking accounts, since the summary covers one account', () => {
+    expect(
+      hasRegularLoans({ multiCheckingFlag: true, TotalPerTypeItems: [{ accountType: 'CHECKING' }] }),
+    ).toBeUndefined();
+  });
+
+  test('is unknown when the summary is missing or unexpected', () => {
+    expect(hasRegularLoans(null)).toBeUndefined();
+    expect(hasRegularLoans({ multiCheckingFlag: false })).toBeUndefined();
+  });
+});
+
 describe('fetchLeumiLoans', () => {
-  // fetchGetWithinPage resolves `page.evaluate` to [responseText, status]
-  function mockPage(responses: Record<string, unknown>): Page {
+  const LOAN_ACTIVITY_URL = 'https://hb2.bankleumi.co.il/eBanking/LoanAndMortgages/DisplayLoanActivity.aspx';
+
+  /**
+   * @param responses JSON API responses by URL suffix; fetchGetWithinPage resolves `page.evaluate` to [text, status]
+   * @param loanPages label/value fields of each loan details page, by its index in the loans dropdown
+   */
+  function mockPage(responses: Record<string, unknown>, loanPages?: Record<string, Record<string, string>>): Page {
+    let currentUrl = '';
     return {
       evaluate: jest.fn((_fn: unknown, url: string) => {
         const key = Object.keys(responses).find(suffix => url.endsWith(suffix));
@@ -186,22 +274,109 @@ describe('fetchLeumiLoans', () => {
         }
         return Promise.resolve([typeof response === 'string' ? response : JSON.stringify(response), 200]);
       }),
+      goto: jest.fn((url: string) => {
+        currentUrl = url;
+        return Promise.resolve(null);
+      }),
+      $: jest.fn((selector: string) => {
+        const onLoansPage = !!loanPages && currentUrl.startsWith(LOAN_ACTIVITY_URL);
+        const index = new URL(currentUrl || 'https://x').searchParams.get('index');
+        const present =
+          (selector === '#ddlAccounts_m_ddl' && onLoansPage) ||
+          (selector === '#pnlVariousData' && onLoansPage && !!index && !!loanPages?.[index]);
+        return Promise.resolve(present ? {} : null);
+      }),
+      $$eval: jest.fn((selector: string, fn: (elements: unknown[], arg?: unknown) => unknown, arg?: unknown) => {
+        if (selector.endsWith('option')) {
+          const values = ['-1', ...Object.keys(loanPages ?? {})];
+          return Promise.resolve(
+            fn(
+              values.map(value => ({ value })),
+              arg,
+            ),
+          );
+        }
+        const index = new URL(currentUrl).searchParams.get('index') ?? '';
+        const labels = Object.entries(loanPages?.[index] ?? {}).map(([label, value]) => ({
+          textContent: `${label}:`,
+          nextElementSibling: { textContent: value },
+        }));
+        return Promise.resolve(fn(labels, arg));
+      }),
     } as unknown as Page;
   }
 
+  const gotoMock = (page: Page) => (page as unknown as { goto: jest.Mock }).goto;
+
   const mortgageDetailsResponse = { loanMortgageItems: [{ MortgageDetail: mortgageDetail }] };
   const loanInfoResponse = { MortgageDetails: { loansItems: [fixedTrack, primeTrack] } };
+  const noLoansSummary = { multiCheckingFlag: false, TotalPerTypeItems: [{ accountType: 'CHECKING' }] };
+  const withLoansSummary = { multiCheckingFlag: false, TotalPerTypeItems: [{ accountType: 'LOAN' }] };
+  const loanPageFields = (loanNumber: string) => ({
+    סוג: 'לא צמוד ר.קבועה',
+    חשבון: '123-45678/90',
+    'מספר הלוואה': loanNumber,
+    מטבע: '₪',
+    'סכום הלוואה מקורי': '60,000.00',
+    'יתרת קרן': '42,500.50',
+  });
 
   test('fetches mortgages and their tracks', async () => {
-    const page = mockPage({ '/mortgageDetails': mortgageDetailsResponse, '/loanInfo': loanInfoResponse });
+    const page = mockPage({
+      '/mortgageDetails': mortgageDetailsResponse,
+      '/loanInfo': loanInfoResponse,
+      '/SummaryData': noLoansSummary,
+    });
     const loans = await fetchLeumiLoans(page);
     expect(loans).toHaveLength(1);
     expect(loans?.[0].tracks).toHaveLength(2);
   });
 
-  test('returns an empty list when the customer has no mortgages', async () => {
-    const page = mockPage({ '/mortgageDetails': { loanMortgageItems: [] } });
+  test('returns an empty list when the customer has no mortgages and no loans', async () => {
+    const page = mockPage({ '/mortgageDetails': { loanMortgageItems: [] }, '/SummaryData': noLoansSummary });
     expect(await fetchLeumiLoans(page)).toEqual([]);
+  });
+
+  test('does not open the loans page when the summary shows no loans', async () => {
+    const page = mockPage({ '/mortgageDetails': mortgageDetailsResponse, '/SummaryData': noLoansSummary });
+    await fetchLeumiLoans(page);
+    expect(gotoMock(page)).not.toHaveBeenCalled();
+  });
+
+  test('fetches each regular loan from its own page, skipping the dropdown placeholder', async () => {
+    const page = mockPage(
+      { '/mortgageDetails': mortgageDetailsResponse, '/loanInfo': loanInfoResponse, '/SummaryData': withLoansSummary },
+      { '11': loanPageFields('111111'), '12': loanPageFields('222222') },
+    );
+    const loans = await fetchLeumiLoans(page);
+    expect(loans?.map(loan => [loan.type, loan.loanId])).toEqual([
+      [LoanTypes.Mortgage, '1234567890123'],
+      [LoanTypes.Loan, '111111'],
+      [LoanTypes.Loan, '222222'],
+    ]);
+    expect(gotoMock(page)).toHaveBeenCalledWith(`${LOAN_ACTIVITY_URL}?index=11`, expect.anything());
+    expect(gotoMock(page)).not.toHaveBeenCalledWith(`${LOAN_ACTIVITY_URL}?index=-1`, expect.anything());
+  });
+
+  test('opens the loans page when the summary is unavailable', async () => {
+    const page = mockPage(
+      { '/mortgageDetails': { loanMortgageItems: [] }, '/SummaryData': new Error('network') },
+      { '11': loanPageFields('111111') },
+    );
+    expect(await fetchLeumiLoans(page)).toHaveLength(1);
+  });
+
+  test('returns undefined when the loans page is expected but not found', async () => {
+    const page = mockPage({ '/mortgageDetails': mortgageDetailsResponse, '/SummaryData': withLoansSummary });
+    expect(await fetchLeumiLoans(page)).toBeUndefined();
+  });
+
+  test('returns undefined when any regular loan cannot be mapped, rather than a partial list', async () => {
+    const page = mockPage(
+      { '/mortgageDetails': { loanMortgageItems: [] }, '/SummaryData': withLoansSummary },
+      { '11': loanPageFields('111111'), '12': { ...loanPageFields('222222'), מטבע: '$' } },
+    );
+    expect(await fetchLeumiLoans(page)).toBeUndefined();
   });
 
   test('returns undefined, not an empty list, when the response is not the expected shape', async () => {
@@ -220,7 +395,11 @@ describe('fetchLeumiLoans', () => {
   });
 
   test('keeps the mortgage without tracks when only the tracks request fails', async () => {
-    const page = mockPage({ '/mortgageDetails': mortgageDetailsResponse, '/loanInfo': new Error('network') });
+    const page = mockPage({
+      '/mortgageDetails': mortgageDetailsResponse,
+      '/loanInfo': new Error('network'),
+      '/SummaryData': noLoansSummary,
+    });
     const loans = await fetchLeumiLoans(page);
     expect(loans).toHaveLength(1);
     expect(loans?.[0].tracks).toBeUndefined();
@@ -235,6 +414,7 @@ describe('fetchLeumiLoans', () => {
         ],
       },
       '/loanInfo': loanInfoResponse,
+      '/SummaryData': noLoansSummary,
     });
     expect(await fetchLeumiLoans(page)).toBeUndefined();
   });

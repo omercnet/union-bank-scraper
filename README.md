@@ -305,7 +305,7 @@ const credentials = {
 };
 ```
 This scraper supports fetching transaction from up to one year.
-With `includeLoans: true`, mortgages (including their tracks) are returned under `loans`. Regular loans are not supported yet.
+With `includeLoans: true`, mortgages (including their tracks) and shekel loans are returned under `loans`.
 
 ## Discount scraper
 This scraper expects the following credentials object:
