@@ -542,9 +542,10 @@ class BeinleumiGroupBaseScraper extends BaseScraperWithBrowser<ScraperSpecificCr
 
     const { accounts, accountsIds } = await fetchAccounts(this.page, startMoment, this.options);
 
-    // the loans page shows only the account currently selected in the session, so loans are only
-    // fetched when the accounts list was read and has a single account
-    const isSingleAccount = accountsIds.length === 1;
+    // the loans page shows only the account currently selected in the session, so loans are skipped
+    // when the accounts list shows more than one account. Single account customers have no accounts
+    // list, so an empty list can't be told apart from one that failed to load.
+    const isSingleAccount = accountsIds.length <= 1 && accounts.length === 1;
     if (this.options.includeLoans && !isSingleAccount) {
       debug('skipping loans, %d account ids were found', accountsIds.length);
     }
