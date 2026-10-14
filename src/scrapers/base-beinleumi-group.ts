@@ -1,6 +1,7 @@
 import moment, { type Moment } from 'moment';
 import { type Frame, type Page } from 'puppeteer';
 import { SHEKEL_CURRENCY, SHEKEL_CURRENCY_SYMBOL } from '../constants';
+import { getDebug } from '../helpers/debug';
 import {
   clickButton,
   elementPresentOnPage,
@@ -15,6 +16,8 @@ import { TransactionStatuses, TransactionTypes, type Transaction, type Transacti
 import { BaseScraperWithBrowser, LoginResults, type PossibleLoginResults } from './base-scraper-with-browser';
 import { fetchBeinleumiLoans } from './beinleumi-loans';
 import { type ScraperOptions } from './interface';
+
+const debug = getDebug('beinleumi-group');
 
 const DATE_FORMAT = 'DD/MM/YYYY';
 const NO_TRANSACTION_IN_DATE_RANGE_TEXT = 'לא נמצאו נתונים בנושא המבוקש';
@@ -482,13 +485,17 @@ async function fetchAccountDataBothUIs(
   return fetchAccountData(targetPage, startDate, options);
 }
 
-async function fetchAccounts(page: Page, startDate: Moment, options?: ScraperOptions): Promise<TransactionsAccount[]> {
+async function fetchAccounts(
+  page: Page,
+  startDate: Moment,
+  options?: ScraperOptions,
+): Promise<{ accounts: TransactionsAccount[]; accountsIds: string[] }> {
   const accountsIds = await getAccountIdsBothUIs(page);
 
   if (accountsIds.length === 0) {
     // In case accountsIds could no be parsed just return the transactions of the currently selected account
     const accountData = await fetchAccountDataBothUIs(page, startDate, options);
-    return [accountData];
+    return { accounts: [accountData], accountsIds };
   }
 
   const accounts: TransactionsAccount[] = [];
@@ -498,7 +505,7 @@ async function fetchAccounts(page: Page, startDate: Moment, options?: ScraperOpt
     accounts.push(accountData);
   }
 
-  return accounts;
+  return { accounts, accountsIds };
 }
 
 type ScraperSpecificCredentials = { username: string; password: string };
@@ -533,11 +540,16 @@ class BeinleumiGroupBaseScraper extends BaseScraperWithBrowser<ScraperSpecificCr
 
     await this.navigateTo(this.TRANSACTIONS_URL);
 
-    const accounts = await fetchAccounts(this.page, startMoment, this.options);
+    const { accounts, accountsIds } = await fetchAccounts(this.page, startMoment, this.options);
 
-    // the loans page shows only the account currently selected in the session
+    // the loans page shows only the account currently selected in the session, so loans are only
+    // fetched when the accounts list was read and has a single account
+    const isSingleAccount = accountsIds.length === 1;
+    if (this.options.includeLoans && !isSingleAccount) {
+      debug('skipping loans, %d account ids were found', accountsIds.length);
+    }
     const loans =
-      this.options.includeLoans && accounts.length === 1
+      this.options.includeLoans && isSingleAccount
         ? await fetchBeinleumiLoans(this.page, this.BASE_URL, getAccountNumber)
         : undefined;
 

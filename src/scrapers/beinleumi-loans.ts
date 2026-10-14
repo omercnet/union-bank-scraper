@@ -12,7 +12,6 @@ const LOANS_PATH = '/wps/myportal/FibiMenu/Online/OnLoansMortgageMenu/OnLoans/Au
 // exchanges a loan for a one-time URL of the payment schedule app
 const AUTH_SSO_PATH = '/MatafRestApiService/rest/authSSO/authSSO';
 const LOAN_REPAYMENTS_API = 'getLoanRepayments';
-const LOAN_REPAYMENTS_TIMEOUT_MS = 30000;
 // the table of shekel loans; foreign currency loans are not supported
 const LOANS_TABLE = 'table#HalvaaNewMerged';
 const DATE_FORMAT = 'DD/MM/YY';
@@ -48,9 +47,16 @@ function parseDate(value: string): string | undefined {
   return date.isValid() ? date.toISOString() : undefined;
 }
 
-function parseAmount(value: string): number | undefined {
-  const amount = parseFloat(value.replace(/[^\d.-]/g, ''));
-  return Number.isNaN(amount) ? undefined : amount;
+/**
+ * Parses a displayed number such as "1,234.56", "₪ 1,234.56" or "4.5%". Returns undefined for
+ * anything else rather than extracting a misleading number from it.
+ */
+export function parseAmount(value: string): number | undefined {
+  const text = value.replace(/[₪%\s\u200e\u200f]/g, '');
+  if (!text || !/^-?(\d{1,3}(,\d{3})+|\d+)(\.\d+)?$/.test(text)) {
+    return undefined;
+  }
+  return parseFloat(text.replace(/,/g, ''));
 }
 
 /**
@@ -59,10 +65,15 @@ function parseAmount(value: string): number | undefined {
  */
 export function parseInterestRate(value: string): { interestRate?: number; interestType?: LoanInterestTypes } {
   const text = value.replace(/\s+/g, ' ').trim();
-  const effectiveRate = /\(\s*(-?[\d.]+)\s*%\s*\)/.exec(text);
-  const interestRate = parseAmount(effectiveRate ? effectiveRate[1] : text);
-  const interestType = text.startsWith('P') ? LoanInterestTypes.Variable : undefined;
-  return { interestRate, interestType };
+  if (text.startsWith('P')) {
+    // without the current rate in parentheses, only the spread from prime is shown
+    const effectiveRate = /\(\s*(-?[\d.]+)\s*%\s*\)/.exec(text);
+    return {
+      interestRate: effectiveRate ? parseAmount(effectiveRate[1]) : undefined,
+      interestType: LoanInterestTypes.Variable,
+    };
+  }
+  return { interestRate: parseAmount(text), interestType: undefined };
 }
 
 export interface LoanScheduleArgs {
@@ -203,13 +214,16 @@ async function fetchPrincipalBalance(page: Page, baseUrl: string, args: LoanSche
     }
 
     schedulePage = await page.browserContext().newPage();
-    const repaymentsResponse = schedulePage.waitForResponse(
-      // skip the CORS preflight request, which has no body
-      response => response.url().includes(LOAN_REPAYMENTS_API) && response.request().method() === 'GET',
-      { timeout: LOAN_REPAYMENTS_TIMEOUT_MS },
-    );
-    await schedulePage.goto(scheduleUrl);
-    const repayments = (await (await repaymentsResponse).json()) as LoanRepaymentsResponse;
+    schedulePage.setDefaultTimeout(page.getDefaultTimeout());
+    // awaited together, so a failed navigation can't leave the response wait as an unhandled rejection
+    const [repaymentsResponse] = await Promise.all([
+      schedulePage.waitForResponse(
+        // skip the CORS preflight request, which has no body
+        response => response.url().includes(LOAN_REPAYMENTS_API) && response.request().method() === 'GET',
+      ),
+      schedulePage.goto(scheduleUrl),
+    ]);
+    const repayments = (await repaymentsResponse.json()) as LoanRepaymentsResponse;
 
     if (String(repayments.loanNumber) !== args.loanNumber || typeof repayments.balance !== 'number') {
       debug('unexpected payment schedule response');
@@ -227,8 +241,12 @@ async function fetchPrincipalBalance(page: Page, baseUrl: string, args: LoanSche
 async function findLoansTableFrame(page: Page): Promise<Frame | null> {
   for (let attempt = 0; attempt < FIND_TABLE_ATTEMPTS; attempt++) {
     for (const frame of page.frames()) {
-      if (await elementPresentOnPage(frame, LOANS_TABLE)) {
-        return frame;
+      try {
+        if (await elementPresentOnPage(frame, LOANS_TABLE)) {
+          return frame;
+        }
+      } catch {
+        // the frame is navigating or was detached, so it's checked again on the next attempt
       }
     }
     await sleep(FIND_TABLE_INTERVAL_MS);
