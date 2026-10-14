@@ -1,5 +1,13 @@
 import { LoanInterestTypes, LoanTypes } from '../transactions';
-import { mapLoanRow, mapLoanRows, parseInterestRate, parseLoanNumber, type ScrapedLoanRow } from './beinleumi-loans';
+import {
+  mapLoanRow,
+  mapLoanRows,
+  parseInterestRate,
+  parseLoanNumber,
+  parseScheduleArgs,
+  parseScheduleUrl,
+  type ScrapedLoanRow,
+} from './beinleumi-loans';
 
 const loanRow: ScrapedLoanRow = {
   cells: [
@@ -43,6 +51,42 @@ describe('parseLoanNumber', () => {
   });
 });
 
+describe('parseScheduleArgs', () => {
+  test('reads all the payment schedule link arguments', () => {
+    expect(parseScheduleArgs('javascript:luachSilukin(105,20240315,456);')).toEqual({
+      accountType: 105,
+      loanDate: 20240315,
+      loanNumber: '456',
+    });
+  });
+
+  test('returns undefined for an unexpected link', () => {
+    expect(parseScheduleArgs('javascript:luachSilukin(105);')).toBeUndefined();
+  });
+});
+
+describe('parseScheduleUrl', () => {
+  const baseUrl = 'https://online.example.co.il';
+  const scheduleUrl = 'https://apps.example.co.il/Resources/loan-repayments?code=abc&X-FIBI-Transaction-ID=1';
+
+  test('accepts a URL returned as a JSON string', () => {
+    expect(parseScheduleUrl(JSON.stringify(scheduleUrl), baseUrl)).toBe(scheduleUrl);
+  });
+
+  test('accepts a URL returned as plain text', () => {
+    expect(parseScheduleUrl(` ${scheduleUrl} `, baseUrl)).toBe(scheduleUrl);
+  });
+
+  test('rejects a URL without a code', () => {
+    expect(parseScheduleUrl('https://apps.example.co.il/Resources/loan-repayments', baseUrl)).toBeUndefined();
+  });
+
+  test('rejects an error object or an empty response', () => {
+    expect(parseScheduleUrl('{"error":"failed"}', baseUrl)).toBeUndefined();
+    expect(parseScheduleUrl('', baseUrl)).toBeUndefined();
+  });
+});
+
 describe('mapLoanRow', () => {
   test('maps a loans table row', () => {
     expect(mapLoanRow(loanRow, '123456')).toEqual({
@@ -62,7 +106,7 @@ describe('mapLoanRow', () => {
     });
   });
 
-  test('does not report a principal balance, since the table only shows the total debt', () => {
+  test('leaves the principal balance to the payment schedule, since the table only shows the total debt', () => {
     expect(mapLoanRow(loanRow, '123456')?.principalBalance).toBeUndefined();
   });
 

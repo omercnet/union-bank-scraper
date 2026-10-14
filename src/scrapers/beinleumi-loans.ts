@@ -9,6 +9,10 @@ import { LoanInterestTypes, LoanTypes, type Loan } from '../transactions';
 const debug = getDebug('beinleumi-loans');
 
 const LOANS_PATH = '/wps/myportal/FibiMenu/Online/OnLoansMortgageMenu/OnLoans/AuthLoansDetails';
+// exchanges a loan for a one-time URL of the payment schedule app
+const AUTH_SSO_PATH = '/MatafRestApiService/rest/authSSO/authSSO';
+const LOAN_REPAYMENTS_API = 'getLoanRepayments';
+const LOAN_REPAYMENTS_TIMEOUT_MS = 30000;
 // the table of shekel loans; foreign currency loans are not supported
 const LOANS_TABLE = 'table#HalvaaNewMerged';
 const DATE_FORMAT = 'DD/MM/YY';
@@ -61,9 +65,54 @@ export function parseInterestRate(value: string): { interestRate?: number; inter
   return { interestRate, interestType };
 }
 
+export interface LoanScheduleArgs {
+  accountType: number;
+  loanDate: number;
+  loanNumber: string;
+}
+
+/**
+ * Reads the arguments of the payment schedule link, "javascript:luachSilukin(accountType,loanDate,loanNumber);"
+ */
+export function parseScheduleArgs(scheduleHref: string): LoanScheduleArgs | undefined {
+  const match = /luachSilukin\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)/.exec(scheduleHref);
+  if (!match) {
+    return undefined;
+  }
+  const [, accountType, loanDate, loanNumber] = match;
+  return { accountType: Number(accountType), loanDate: Number(loanDate), loanNumber };
+}
+
 export function parseLoanNumber(scheduleHref: string): string | undefined {
-  const match = /luachSilukin\(\s*\d+\s*,\s*\d+\s*,\s*(\d+)\s*\)/.exec(scheduleHref);
-  return match ? match[1] : undefined;
+  return parseScheduleArgs(scheduleHref)?.loanNumber;
+}
+
+/**
+ * The SSO endpoint responds with the schedule app URL, as a JSON string or as plain text.
+ * Returns undefined unless it is a URL carrying a one-time code.
+ */
+export function parseScheduleUrl(responseText: string, baseUrl: string): string | undefined {
+  let value: unknown = responseText.trim();
+  try {
+    value = JSON.parse(responseText);
+  } catch {
+    // plain text response
+  }
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  try {
+    const url = new URL(value, baseUrl);
+    return url.searchParams.get('code') ? url.toString() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+interface LoanRepaymentsResponse {
+  loanNumber?: number;
+  // the remaining principal, which equals the sum of the principal of all future payments
+  balance?: number;
 }
 
 export function mapLoanRow(row: ScrapedLoanRow, accountNumber: string): Loan | null {
@@ -121,6 +170,60 @@ async function scrapeLoanRows(frame: Page | Frame): Promise<ScrapedLoanRow[]> {
   );
 }
 
+/**
+ * Fetches the remaining principal from the payment schedule app, which the bank opens in an iframe
+ * using a one-time URL. The URL is opened in a separate page, as the app's API is on another domain.
+ *
+ * Errors are not logged, since they may include the URL and its one-time code.
+ */
+async function fetchPrincipalBalance(page: Page, baseUrl: string, args: LoanScheduleArgs): Promise<number | undefined> {
+  let schedulePage: Page | undefined;
+  try {
+    const responseText = await page.evaluate(
+      async (url, body) => {
+        const response = await fetch(url, {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+          body: JSON.stringify(body),
+        });
+        return response.ok ? response.text() : '';
+      },
+      new URL(AUTH_SSO_PATH, baseUrl).toString(),
+      {
+        TPPName: 'loanRepayments',
+        requestData: { LoanId: Number(args.loanNumber), AccountType: args.accountType, LoanDate: args.loanDate },
+      },
+    );
+
+    const scheduleUrl = parseScheduleUrl(responseText, baseUrl);
+    if (!scheduleUrl) {
+      debug('unexpected payment schedule SSO response');
+      return undefined;
+    }
+
+    schedulePage = await page.browserContext().newPage();
+    const repaymentsResponse = schedulePage.waitForResponse(
+      // skip the CORS preflight request, which has no body
+      response => response.url().includes(LOAN_REPAYMENTS_API) && response.request().method() === 'GET',
+      { timeout: LOAN_REPAYMENTS_TIMEOUT_MS },
+    );
+    await schedulePage.goto(scheduleUrl);
+    const repayments = (await (await repaymentsResponse).json()) as LoanRepaymentsResponse;
+
+    if (String(repayments.loanNumber) !== args.loanNumber || typeof repayments.balance !== 'number') {
+      debug('unexpected payment schedule response');
+      return undefined;
+    }
+    return repayments.balance;
+  } catch {
+    debug('could not fetch the payment schedule');
+    return undefined;
+  } finally {
+    await schedulePage?.close().catch(() => {});
+  }
+}
+
 async function findLoansTableFrame(page: Page): Promise<Frame | null> {
   for (let attempt = 0; attempt < FIND_TABLE_ATTEMPTS; attempt++) {
     for (const frame of page.frames()) {
@@ -160,7 +263,18 @@ export async function fetchBeinleumiLoans(
     const accountNumber = await getAccountNumber(frame);
     const rows = await scrapeLoanRows(frame);
     debug('found %d loans', rows.length);
-    return mapLoanRows(rows, accountNumber);
+    const loans = mapLoanRows(rows, accountNumber);
+
+    // the principal is optional, so a loan is kept even when its payment schedule can't be fetched
+    for (const [index, loan] of (loans ?? []).entries()) {
+      const args = parseScheduleArgs(rows[index].scheduleHref);
+      const principalBalance = args ? await fetchPrincipalBalance(page, baseUrl, args) : undefined;
+      if (principalBalance !== undefined) {
+        loan.principalBalance = principalBalance;
+      }
+    }
+
+    return loans;
   } catch (error) {
     debug('error fetching loans: %s', error);
     return undefined;

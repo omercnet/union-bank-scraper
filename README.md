@@ -363,7 +363,7 @@ const credentials = {
 };
 ```
 This scraper supports fetching transaction from up to one year.
-With `includeLoans: true`, shekel loans are returned under `loans`, for customers with a single account. The remaining principal is not available yet. The same code runs for the Beinleumi, Massad and Pagi scrapers, but it has only been verified against Otsar Hahayal.
+With `includeLoans: true`, shekel loans are returned under `loans`, for customers with a single account. The same code runs for the Beinleumi, Massad and Pagi scrapers, but it has only been verified against Otsar Hahayal.
 
 ## Visa Cal scraper
 This scraper expects the following credentials object:
