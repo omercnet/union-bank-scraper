@@ -13,6 +13,7 @@ import { getRawTransaction } from '../helpers/transactions';
 import { sleep } from '../helpers/waiting';
 import { TransactionStatuses, TransactionTypes, type Transaction, type TransactionsAccount } from '../transactions';
 import { BaseScraperWithBrowser, LoginResults, type PossibleLoginResults } from './base-scraper-with-browser';
+import { fetchBeinleumiLoans } from './beinleumi-loans';
 import { type ScraperOptions } from './interface';
 
 const DATE_FORMAT = 'DD/MM/YYYY';
@@ -224,7 +225,7 @@ async function searchByDates(page: Page | Frame, startDate: Moment) {
   await waitForNavigation(page);
 }
 
-async function getAccountNumber(page: Page | Frame): Promise<string> {
+export async function getAccountNumber(page: Page | Frame): Promise<string> {
   // Wait until the account number element is present in the DOM
   await waitUntilElementFound(page, ACCOUNTS_NUMBER, true, ELEMENT_RENDER_TIMEOUT_MS);
 
@@ -534,9 +535,16 @@ class BeinleumiGroupBaseScraper extends BaseScraperWithBrowser<ScraperSpecificCr
 
     const accounts = await fetchAccounts(this.page, startMoment, this.options);
 
+    // the loans page shows only the account currently selected in the session
+    const loans =
+      this.options.includeLoans && accounts.length === 1
+        ? await fetchBeinleumiLoans(this.page, this.BASE_URL, getAccountNumber)
+        : undefined;
+
     return {
       success: true,
       accounts,
+      ...(loans && { loans }),
     };
   }
 }
