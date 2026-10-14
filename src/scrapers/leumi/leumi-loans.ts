@@ -106,12 +106,27 @@ function parseDate(value?: string | null, format = DATE_FORMAT): string | undefi
   return date.isValid() ? date.toISOString() : undefined;
 }
 
-function parseAmount(value?: string): number | undefined {
-  if (!value) {
+/**
+ * Parses a displayed number such as "1,234.56", "₪ 1,234.56" or "4.5%". Returns undefined for
+ * anything else, e.g. "פריים+1.5%", rather than extracting a misleading number from it.
+ */
+export function parseAmount(value?: string): number | undefined {
+  const text = value?.replace(/[₪%\s\u200e\u200f]/g, '');
+  if (!text || !/^-?(\d{1,3}(,\d{3})+|\d+)(\.\d+)?$/.test(text)) {
     return undefined;
   }
-  const amount = parseFloat(value.replace(/[^\d.-]/g, ''));
-  return Number.isNaN(amount) ? undefined : amount;
+  return parseFloat(text.replace(/,/g, ''));
+}
+
+function toNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * Converts a displayed account number ("BBB-AAAAA/SS") to the format of `TransactionsAccount.accountNumber`.
+ */
+function normalizeAccountNumber(account: string): string {
+  return account.replace('/', '_').replace(/[^\d-_]/g, '');
 }
 
 export function mapLeumiCurrency(code: string): string | undefined {
@@ -161,20 +176,25 @@ export function mapMortgageTrack(track: LeumiMortgageTrack, accountNumber: strin
     debug('unknown currency code %s on mortgage track', track.currencyLeumi);
     return null;
   }
+  const originalAmount = toNumber(track.loanAmount);
+  if (!track.loanId || originalAmount === undefined) {
+    debug('mortgage track is missing its id or amount');
+    return null;
+  }
 
   return {
     type: LoanTypes.Mortgage,
     accountNumber,
-    loanId: track.loanId,
+    loanId: String(track.loanId),
     name: track.productName,
     currency,
-    originalAmount: track.loanAmount,
-    principalBalance: track.fundBalance,
-    totalBalance: track.clearingBalance,
+    originalAmount,
+    principalBalance: toNumber(track.fundBalance),
+    totalBalance: toNumber(track.clearingBalance),
     startDate: parseDate(track.loanCreditDate),
     endDate: parseDate(track.calculateEndDate),
-    lastPaymentAmount: track.paymentItems?.[0]?.paymentAmount,
-    interestRate: track.annualInterestPercent ?? undefined,
+    lastPaymentAmount: toNumber(track.paymentItems?.[0]?.paymentAmount),
+    interestRate: toNumber(track.annualInterestPercent),
     interestType: mapInterestType(track.interestType),
     linkage: mapLinkage(track.linkageBase),
   };
@@ -185,7 +205,11 @@ export function mapMortgageTrack(track: LeumiMortgageTrack, accountNumber: strin
  */
 function getMortgageLastPaymentAmount(tracks: LeumiMortgageTrack[]): number | undefined {
   const lastPayments = tracks.map(track => track.paymentItems?.[0]);
-  if (!lastPayments.length || lastPayments.some(payment => payment?.paymentDate !== lastPayments[0]?.paymentDate)) {
+  const month = lastPayments[0]?.paymentDate;
+  if (
+    !month ||
+    lastPayments.some(payment => payment?.paymentDate !== month || toNumber(payment.paymentAmount) === undefined)
+  ) {
     return undefined;
   }
   return lastPayments.reduce((sum, payment) => sum + (payment?.paymentAmount ?? 0), 0);
@@ -212,27 +236,34 @@ export function mapMortgage(detail: LeumiMortgageDetail, tracks: LeumiMortgageTr
     debug('unknown currency code %s on mortgage', detail.currencyLeumi);
     return null;
   }
-  if (!detail.balanceItems?.length) {
-    debug('mortgage has no balance items');
+  const portfolioAccountNum = detail.portfolioAccountsItems?.[0]?.portfolioAccountNum;
+  const originalAmount = toNumber(detail.mortgageAmount);
+  if (!detail.mortgageKey || !portfolioAccountNum || originalAmount === undefined) {
+    debug('mortgage is missing its key, account or amount');
     return null;
   }
 
-  const portfolioAccountNum = detail.portfolioAccountsItems?.[0]?.portfolioAccountNum;
-  const accountNumber = portfolioAccountNum ? mapPortfolioAccountNumber(portfolioAccountNum) : '';
+  const accountNumber = mapPortfolioAccountNumber(portfolioAccountNum);
+  const fundBalances = (detail.balanceItems ?? []).map(item => toNumber(item.fundBalance));
+  const mappedTracks = mapMortgageTracks(tracks, accountNumber);
 
   return {
     type: LoanTypes.Mortgage,
     accountNumber,
-    loanId: detail.mortgageKey,
+    loanId: String(detail.mortgageKey),
     name: detail.mortgagePurpose,
     currency,
-    originalAmount: detail.mortgageAmount,
-    principalBalance: detail.balanceItems.reduce((sum, item) => sum + item.fundBalance, 0),
-    totalBalance: detail.clearingBalance,
+    originalAmount,
+    principalBalance:
+      fundBalances.length && fundBalances.every(balance => balance !== undefined)
+        ? fundBalances.reduce((sum: number, balance) => sum + (balance ?? 0), 0)
+        : undefined,
+    totalBalance: toNumber(detail.clearingBalance),
     startDate: parseDate(detail.bookingDate),
     endDate: parseDate(detail.mortgageEndDate),
-    lastPaymentAmount: tracks ? getMortgageLastPaymentAmount(tracks) : undefined,
-    tracks: mapMortgageTracks(tracks, accountNumber),
+    // computed only from tracks that were all mapped, so a rejected track (e.g. another currency) isn't summed in
+    lastPaymentAmount: tracks && mappedTracks ? getMortgageLastPaymentAmount(tracks) : undefined,
+    tracks: mappedTracks,
   };
 }
 
@@ -263,7 +294,7 @@ export function mapLoanPageFields(fields: Record<string, string>): Loan | null {
   const name = fields[LOAN_LABELS.type];
   return {
     type: LoanTypes.Loan,
-    accountNumber: account.replace('/', '_'),
+    accountNumber: normalizeAccountNumber(account),
     loanId,
     name,
     currency,

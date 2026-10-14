@@ -119,6 +119,8 @@ The structure of the result object is as follows:
     startDate: string, // ISO date string, if available
     endDate: string, // ISO date string, if available
     lastPaymentAmount: double, // the most recent periodic payment, if available
+    nextPaymentAmount: double, // if available
+    nextPaymentDate: string, // ISO date string, if available
     interestRate: double, // annual percent, if available
     interestType: string, // 'fixed' or 'variable', if available
     linkage: string, // 'none' or 'cpi', if available
@@ -305,7 +307,7 @@ const credentials = {
 };
 ```
 This scraper supports fetching transaction from up to one year.
-With `includeLoans: true`, mortgages (including their tracks) and shekel loans are returned under `loans`.
+With `includeLoans: true`, mortgages (including their tracks) and shekel loans are returned under `loans`. For customers with more than one checking account, `loans` may be missing when the bank's regular loans page can't be read, since "no regular loans" can't be told apart from an error for them.
 
 ## Discount scraper
 This scraper expects the following credentials object:

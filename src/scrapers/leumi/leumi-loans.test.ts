@@ -9,6 +9,7 @@ import {
   mapMortgage,
   mapMortgageTrack,
   mapPortfolioAccountNumber,
+  parseAmount,
   type LeumiMortgageDetail,
   type LeumiMortgageTrack,
 } from './leumi-loans';
@@ -95,6 +96,22 @@ describe('mapInterestType', () => {
   });
 });
 
+describe('parseAmount', () => {
+  test('parses displayed numbers', () => {
+    expect(parseAmount('1,234.56')).toBe(1234.56);
+    expect(parseAmount(' ₪ 1,234,567.89')).toBe(1234567.89);
+    expect(parseAmount('4.5%')).toBe(4.5);
+    expect(parseAmount('-12')).toBe(-12);
+  });
+
+  test('returns undefined rather than extracting a number from other text', () => {
+    expect(parseAmount('פריים+1.5%')).toBeUndefined();
+    expect(parseAmount('1.2.3')).toBeUndefined();
+    expect(parseAmount('12,34')).toBeUndefined();
+    expect(parseAmount('')).toBeUndefined();
+  });
+});
+
 describe('mapMortgageTrack', () => {
   test('maps a track, taking the newest payment as the last payment', () => {
     expect(mapMortgageTrack(fixedTrack, '123-45678_90')).toEqual({
@@ -168,8 +185,27 @@ describe('mapMortgage', () => {
     expect(mapMortgage({ ...mortgageDetail, currencyLeumi: '999' }, [fixedTrack])).toBeNull();
   });
 
-  test('returns null when the principal balance is missing, rather than reporting zero', () => {
-    expect(mapMortgage({ ...mortgageDetail, balanceItems: [] }, [fixedTrack])).toBeNull();
+  test('leaves the principal balance undefined when it is missing, rather than reporting zero', () => {
+    expect(mapMortgage({ ...mortgageDetail, balanceItems: [] }, [fixedTrack])?.principalBalance).toBeUndefined();
+    const withNull = {
+      ...mortgageDetail,
+      balanceItems: [{ fundBalance: 400000, clearingBalance: 1 }, { fundBalance: null }],
+    };
+    expect(mapMortgage(withNull as unknown as LeumiMortgageDetail, [fixedTrack])?.principalBalance).toBeUndefined();
+  });
+
+  test('returns null when the account is missing, rather than an empty account number', () => {
+    expect(mapMortgage({ ...mortgageDetail, portfolioAccountsItems: [] }, [fixedTrack])).toBeNull();
+  });
+
+  test('does not report a last payment of zero before any payment was made', () => {
+    const noHistory = [fixedTrack, primeTrack].map(track => ({ ...track, paymentItems: [] }));
+    expect(mapMortgage(mortgageDetail, noHistory)?.lastPaymentAmount).toBeUndefined();
+  });
+
+  test('does not sum the last payment of a track that could not be mapped', () => {
+    const mortgage = mapMortgage(mortgageDetail, [fixedTrack, { ...primeTrack, currencyLeumi: '999' }]);
+    expect(mortgage?.lastPaymentAmount).toBeUndefined();
   });
 });
 
@@ -216,6 +252,10 @@ describe('mapLoanPageFields', () => {
     const loan = mapLoanPageFields({ ...fields, סוג: 'מט"י ז"א', 'סוג הצמדה': 'צמוד מדד' });
     expect(loan?.interestType).toBeUndefined();
     expect(loan?.linkage).toBeUndefined();
+  });
+
+  test('leaves the rate undefined for a prime based rate label', () => {
+    expect(mapLoanPageFields({ ...fields, 'שיעור ריבית': 'פריים+1.5%' })?.interestRate).toBeUndefined();
   });
 
   test('returns null for a foreign currency loan rather than guessing', () => {
